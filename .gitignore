@@ -4,3 +4,4 @@ data/
 */checkpoints/
 *.npy
 *.pt
+*.safetensors
