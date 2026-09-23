@@ -1,0 +1,1 @@
+{"type": "fixed_linear", "mel_min_db": -80.0, "mel_max_db": 0.0, "norm_min": -1.0, "norm_max": 1.0, "formula": "norm=2*(db-(-80))/80-1"}
