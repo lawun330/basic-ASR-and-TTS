@@ -216,37 +216,141 @@ def save_wav(audio, path, sr):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# §4  Vocoder wrapper
+# §4  Vocoder wrapper  —  HiFi-GAN / WaveGlow / Griffin-Lim  (same as v6)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Vocoder:
-    def __init__(self, cfg, logger, use_neural=True):
-        self.cfg = cfg; self.logger = logger; self._wg = None
-        if use_neural:
-            try:
-                wg = torch.hub.load("NVIDIA/DeepLearningExamples:torchhub",
-                    "nvidia_waveglow", model_math="fp32",
-                    pretrained=True, verbose=False)
-                wg.eval()
-                for m in wg.modules():
-                    if hasattr(m,"weight_g"):
-                        try: nn.utils.remove_weight_norm(m)
-                        except: pass
-                self._wg = wg; logger.info("WaveGlow loaded ✓")
-            except Exception as e:
-                logger.warning(f"WaveGlow unavailable ({type(e).__name__}), "
-                               "using Griffin-Lim.")
+    """
+    Mel → wav.  Select with --vocoder {hifigan,waveglow,griffin_lim}.
+    --no_neural_vocoder is an alias for griffin_lim.
+    Neural backends load from NVIDIA torch.hub; on failure → Griffin-Lim.
+    """
+    def __init__(self, cfg, logger, backend="hifigan", waveglow_sigma=0.6):
+        self.cfg = cfg
+        self.logger = logger
+        self.backend = backend
+        self.waveglow_sigma = float(waveglow_sigma)
+        self._model = None
+        self._denoiser = None
+        if backend == "griffin_lim":
+            logger.info("Vocoder: Griffin-Lim")
+            return
+        if backend == "hifigan":
+            self._load_hifigan()
+        elif backend == "waveglow":
+            self._load_waveglow()
+        else:
+            raise ValueError(f"Unknown vocoder backend: {backend!r}")
+
+    def _hub_load(self, entry):
+        kwargs = dict(pretrained=True, verbose=False)
+        try:
+            return torch.hub.load(
+                "NVIDIA/DeepLearningExamples:torchhub", entry, trust_repo=True,
+                **kwargs)
+        except TypeError:
+            return torch.hub.load(
+                "NVIDIA/DeepLearningExamples:torchhub", entry, **kwargs)
+
+    def _load_hifigan(self):
+        try:
+            loaded = self._hub_load("nvidia_hifigan")
+            if isinstance(loaded, (tuple, list)) and len(loaded) >= 1:
+                self._model = loaded[0]
+                self._denoiser = loaded[2] if len(loaded) > 2 else None
+            else:
+                self._model = loaded
+            self._model.eval()
+            for m in self._model.modules():
+                if hasattr(m, "weight_g"):
+                    try:
+                        nn.utils.remove_weight_norm(m)
+                    except Exception:
+                        pass
+            self.logger.info("HiFi-GAN loaded ✓  (NVIDIA torch.hub)")
+        except Exception as e:
+            self.logger.warning(
+                f"HiFi-GAN unavailable ({type(e).__name__}: {e}); "
+                "using Griffin-Lim."
+            )
+            self.backend = "griffin_lim"
+            self._model = None
+
+    def _load_waveglow(self):
+        try:
+            wg = self._hub_load("nvidia_waveglow")
+            if hasattr(wg, "remove_weightnorm"):
+                wg = wg.remove_weightnorm(wg)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self._model = wg.to(device).eval()
+            self.logger.info(
+                f"WaveGlow loaded ✓  (NVIDIA torch.hub, sigma={self.waveglow_sigma})"
+            )
+        except Exception as e:
+            self.logger.warning(
+                f"WaveGlow unavailable ({type(e).__name__}: {e}); "
+                "using Griffin-Lim."
+            )
+            self.backend = "griffin_lim"
+            self._model = None
 
     def synthesize(self, mel_norm):
-        if self._wg is not None: return self._waveglow(mel_norm)
+        if self.backend == "hifigan" and self._model is not None:
+            try:
+                return self._hifigan_infer(mel_norm)
+            except Exception as e:
+                self.logger.warning(
+                    f"HiFi-GAN infer failed ({type(e).__name__}); "
+                    "falling back to Griffin-Lim."
+                )
+        elif self.backend == "waveglow" and self._model is not None:
+            try:
+                return self._waveglow_infer(mel_norm)
+            except Exception as e:
+                self.logger.warning(
+                    f"WaveGlow infer failed ({type(e).__name__}); "
+                    "falling back to Griffin-Lim."
+                )
         return mel_to_audio_gl(mel_norm, self.cfg)
 
-    def _waveglow(self, mel_norm):
-        t = torch.from_numpy(mel_denormalize(mel_norm).T).float().unsqueeze(0)
-        d = next(self._wg.parameters()).device
-        with torch.no_grad(): a = self._wg.infer(t.to(d), sigma=0.9)
-        a = a.squeeze().cpu().numpy()
-        pk = np.max(np.abs(a)); return (a/pk*0.9).astype(np.float32) if pk>1e-8 else a
+    def _mel_batch(self, mel_norm):
+        mel_db = mel_denormalize(mel_norm).T.astype(np.float32)
+        return torch.from_numpy(mel_db).unsqueeze(0)
+
+    def _peak_norm(self, audio_t):
+        a = audio_t.squeeze().detach().cpu().numpy().astype(np.float32)
+        if a.ndim > 1:
+            a = a.reshape(-1)
+        pk = float(np.max(np.abs(a))) if a.size else 0.0
+        return (a / pk * 0.9).astype(np.float32) if pk > 1e-8 else a
+
+    def _hifigan_infer(self, mel_norm):
+        t = self._mel_batch(mel_norm)
+        d = next(self._model.parameters()).device
+        t = t.to(d)
+        with torch.no_grad():
+            audio = self._model(t)
+            if self._denoiser is not None:
+                try:
+                    audio = self._denoiser(audio.float(), strength=0.01)
+                except Exception:
+                    pass
+        return self._peak_norm(audio)
+
+    def _waveglow_infer(self, mel_norm):
+        t = self._mel_batch(mel_norm)
+        d = next(self._model.parameters()).device
+        t = t.to(d)
+        with torch.no_grad():
+            audio = self._model.infer(t, sigma=self.waveglow_sigma)
+        return self._peak_norm(audio)
+
+
+def resolve_vocoder_backend(args):
+    """Map CLI flags → backend name.  --no_neural_vocoder wins over --vocoder."""
+    if getattr(args, "no_neural_vocoder", False):
+        return "griffin_lim"
+    return getattr(args, "vocoder", "hifigan") or "hifigan"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -640,47 +744,129 @@ def _pango_render(text, font_path, size=14):
     try:
         import gi; gi.require_version("Pango","1.0"); gi.require_version("PangoCairo","1.0")
         from gi.repository import Pango, PangoCairo; import cairo
-        t = cairo.ImageSurface(cairo.FORMAT_ARGB32,1,1); tc=cairo.Context(t)
-        lay=PangoCairo.create_layout(tc); fd=Pango.FontDescription.from_string(f"Myanmar3 {size}")
-        lay.set_font_description(fd); lay.set_text(text,-1)
-        w,h=lay.get_pixel_size(); p=6; w+=2*p; h+=2*p
-        s=cairo.ImageSurface(cairo.FORMAT_ARGB32,w,h); c=cairo.Context(s)
-        c.set_source_rgb(0,0,0); l=PangoCairo.create_layout(c)
-        l.set_font_description(fd); l.set_text(text,-1)
-        c.move_to(p,p); PangoCairo.show_layout(c,l)
-        r=np.frombuffer(s.get_data(),dtype=np.uint8).reshape(h,w,4)
-        return r[...,[2,1,0,3]].copy()
-    except: return None
+        from matplotlib import font_manager
+        # use the real face name from the TTF (Myanmar3 / Padauk / Noto …)
+        face = "sans-serif"
+        if font_path and os.path.exists(font_path):
+            face = font_manager.FontProperties(fname=font_path).get_name()
+        t = cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1); tc = cairo.Context(t)
+        lay = PangoCairo.create_layout(tc)
+        fd = Pango.FontDescription.from_string(f"{face} {size}")
+        lay.set_font_description(fd); lay.set_text(text, -1)
+        w, h = lay.get_pixel_size(); p = 6; w += 2 * p; h += 2 * p
+        s = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h); c = cairo.Context(s)
+        c.set_source_rgb(0, 0, 0); l = PangoCairo.create_layout(c)
+        l.set_font_description(fd); l.set_text(text, -1)
+        c.move_to(p, p); PangoCairo.show_layout(c, l)
+        r = np.frombuffer(s.get_data(), dtype=np.uint8).reshape(h, w, 4)
+        return r[..., [2, 1, 0, 3]].copy()
+    except Exception:
+        return None
+
+
+def _myanmar_font_path():
+    """Prefer mm3 / Padauk (Latin+Myanmar), then Noto Myanmar."""
+    candidates = [
+        "/usr/share/fonts/truetype/mm3-multi-os.ttf",
+        "/usr/share/fonts/truetype/padauk/Padauk-Regular.ttf",
+        "/usr/share/fonts/truetype/padauk/PadaukBook-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansMyanmar-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSerifMyanmar-Regular.ttf",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _split_latin_prefix(title: str):
+    """Split leading ASCII from the rest (e.g. 'GT: ' | 'မင်္ဂလာပါ…')."""
+    i = 0
+    while i < len(title) and ord(title[i]) < 128:
+        i += 1
+    return title[:i], title[i:]
+
+
+def _title_fontproperties(fontsize=11):
+    """Padauk/mm3 (Latin+Myanmar) preferred; never default to DejaVu for Myanmar text."""
+    from matplotlib import font_manager
+    mf = _myanmar_font_path()
+    if not mf:
+        return None, None
+    font_manager.fontManager.addfont(mf)
+    return mf, font_manager.FontProperties(fname=mf, size=fontsize)
+
+
+def _set_mixed_title(ax, title, font_path, fontsize=11):
+    """
+    Noto Myanmar has no Latin glyphs — split ASCII prefix vs Myanmar body.
+    Both halves use TTFs from disk (Padauk for ASCII if available), never DejaVu.
+    """
+    from matplotlib import font_manager
+    title = title[:80]
+    latin, myanmar = _split_latin_prefix(title)
+    # prefer Padauk for Latin so we never touch DejaVu
+    latin_path = font_path
+    for p in (
+        "/usr/share/fonts/truetype/padauk/Padauk-Regular.ttf",
+        "/usr/share/fonts/truetype/padauk/PadaukBook-Regular.ttf",
+        font_path,
+    ):
+        if p and os.path.exists(p):
+            latin_path = p
+            break
+    fp_latin = font_manager.FontProperties(fname=latin_path, size=fontsize)
+    fp_mya = font_manager.FontProperties(fname=font_path, size=fontsize)
+
+    if myanmar and latin:
+        ax.text(0.5, 1.05, latin, transform=ax.transAxes,
+                ha="right", va="bottom", fontproperties=fp_latin,
+                clip_on=False)
+        ax.text(0.5, 1.05, myanmar, transform=ax.transAxes,
+                ha="left", va="bottom", fontproperties=fp_mya,
+                clip_on=False)
+    elif myanmar:
+        ax.set_title(myanmar, fontproperties=fp_mya)
+    else:
+        ax.set_title(latin or title, fontproperties=fp_latin)
 
 
 def plot_mel(mel, title, save_path, logger, vmin=-1.0, vmax=1.0):
     try:
         import matplotlib; matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        from matplotlib import font_manager
         from matplotlib.offsetbox import AnnotationBbox, OffsetImage
-        mf="/usr/share/fonts/truetype/mm3-multi-os.ttf"
-        if os.path.exists(mf):
-            font_manager.fontManager.addfont(mf)
-            fp=font_manager.FontProperties(fname=mf)
-            plt.rcParams["font.family"]="sans-serif"
-            plt.rcParams["font.sans-serif"]=[fp.get_name(),"DejaVu Sans"]
-        fig,ax=plt.subplots(figsize=(12,4))
-        im=ax.imshow(mel.T,aspect="auto",origin="lower",cmap="viridis",
-                     vmin=vmin,vmax=vmax,interpolation="none")
-        plt.colorbar(im,ax=ax,label="Normalised mel [-1,+1]")
+        mf, title_fp = _title_fontproperties(11)
+        fig, ax = plt.subplots(figsize=(12, 4))
+        im = ax.imshow(mel.T, aspect="auto", origin="lower", cmap="viridis",
+                       vmin=vmin, vmax=vmax, interpolation="none")
+        plt.colorbar(im, ax=ax, label="Normalised mel [-1,+1]")
         ax.set_xlabel("Frame"); ax.set_ylabel("Mel bin")
-        rgba=_pango_render(title,mf)
+
+        # Pango only works if `gi` is importable (system Python; often missing in conda)
+        rgba = _pango_render(title, mf) if mf else None
         if rgba is not None:
-            ab=AnnotationBbox(OffsetImage(rgba,zoom=1),(0.5,1.12),
-                              xycoords="axes fraction",
-                              box_alignment=(0.5,0.5),frameon=False)
+            ab = AnnotationBbox(OffsetImage(rgba, zoom=1), (0.5, 1.12),
+                                xycoords="axes fraction",
+                                box_alignment=(0.5, 0.5), frameon=False)
             ax.add_artist(ab)
+        elif mf is not None:
+            # Padauk/mm3 cover Latin+Myanmar → one FontProperties is enough.
+            # Noto Sans Myanmar is Myanmar-only → split Latin / Myanmar fonts.
+            if "Noto" in mf and "Myanmar" in mf:
+                _set_mixed_title(ax, title, mf)
+            else:
+                ax.set_title(title[:80], fontproperties=title_fp)
         else:
-            ax.set_title(title.encode("ascii","replace").decode()[:80],fontsize=9)
-        plt.tight_layout(); plt.savefig(save_path,dpi=150,bbox_inches="tight")
+            ax.set_title(title[:80], fontsize=9)
+            logger.warning(
+                "No Myanmar TTF found; install fonts-sil-padauk / fonts-noto-core "
+                "or mm3 for correct titles."
+            )
+        plt.tight_layout(); plt.savefig(save_path, dpi=150, bbox_inches="tight")
         plt.close(fig); logger.info(f"Mel plot → {save_path}")
-    except Exception as e: logger.warning(f"Mel plot failed: {e}")
+    except Exception as e:
+        logger.warning(f"Mel plot failed: {e}")
 
 
 def plot_comparison(pred, gt, save_path, logger):
@@ -890,6 +1076,16 @@ def run_train(args, logger):
     logger.info("Forced durations: proportional char->mel (or sample['durations'])")
 
     history = []
+    log_path = out / "train_log.json"
+    if log_path.exists():
+        try:
+            prev = json.loads(log_path.read_text())
+            if isinstance(prev, list) and prev:
+                # keep epochs before resume point; drop overlapping if re-run
+                history = [h for h in prev if h.get("epoch", 0) < start]
+        except Exception:
+            history = []
+
     for epoch in range(start, args.epochs+1):
 
         # ── train ─────────────────────────────────────────────────────────────
@@ -947,10 +1143,12 @@ def run_train(args, logger):
 # §13  Inference helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_model(output_dir, logger):
-    out  = Path(output_dir)
-    ckpt = torch.load(out/"best_model.pt", map_location="cpu",
-                      weights_only=False)
+def load_model(output_dir, logger, checkpoint=None):
+    out = Path(output_dir)
+    ckpt_path = Path(checkpoint) if checkpoint else (out / "best_model.pt")
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg  = ckpt["model_config"]
     arch = cfg.get("arch", "TransformerTTSNAR")
     if arch != "TransformerTTSNAR":
@@ -961,8 +1159,11 @@ def load_model(output_dir, logger):
         n_enc_layers=cfg["n_layers"], n_dec_layers=cfg["n_layers"],
         d_ff=cfg["ffn_dim"], dropout=cfg.get("dropout",0.1))
     model.load_state_dict(ckpt["model_state"]); model.eval()
-    logger.info(f"Loaded TransformerTTSNAR: epoch={ckpt.get('epoch','?')} "
-                f"dev={ckpt.get('dev_loss',float('nan')):.4f}")
+    logger.info(
+        f"Loaded TransformerTTSNAR from {ckpt_path.name}: "
+        f"epoch={ckpt.get('epoch','?')}  "
+        f"dev={ckpt.get('dev_loss', float('nan')):.4f}"
+    )
     return model
 
 
@@ -1025,7 +1226,11 @@ def run_synth(args, logger):
     out = Path(args.output_dir)
     vocab, mel_cfg = _load_artifacts(args.output_dir)
     mean_fpc = _load_mean_fpc(args.output_dir, logger)
-    vocoder = Vocoder(mel_cfg, logger, use_neural=not args.no_neural_vocoder)
+    vocoder = Vocoder(
+        mel_cfg, logger,
+        backend=resolve_vocoder_backend(args),
+        waveglow_sigma=args.waveglow_sigma,
+    )
     device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if args.list_samples:
@@ -1038,33 +1243,52 @@ def run_synth(args, logger):
                 break
         return
 
+    # in-set sample: GT playback and/or model synth of that sample's text
+    gm_cached = None
+    gt_text_cached = None
     if args.gt_sample_id:
-        gm, gt = _find_gt_id(args.gt_sample_id, args.output_dir, logger)
-        if gm is None: logger.error(f"Sample '{args.gt_sample_id}' not found."); return
-        logger.info(f"GT text: {gt}")
-        db = mel_denormalize(gm)
+        gm_cached, gt_text_cached = _find_gt_id(
+            args.gt_sample_id, args.output_dir, logger)
+        if gm_cached is None:
+            logger.error(f"Sample '{args.gt_sample_id}' not found."); return
+        logger.info(f"GT text: {gt_text_cached}")
+        db = mel_denormalize(gm_cached)
         logger.info(f"GT mel: min={db.min():.1f} max={db.max():.1f} "
-                    f"mean={db.mean():.1f} dB  shape={gm.shape}")
-        audio = vocoder.synthesize(gm)
-        wpath = args.synth_out or f"gt_{args.gt_sample_id}.wav"
-        save_wav(audio, wpath, mel_cfg.sample_rate)
-        plot_mel(gm, f"GT: {gt[:50]}", str(Path(wpath).with_suffix(".png")), logger)
-        logger.info(f"GT audio → {wpath}  ({len(audio)/mel_cfg.sample_rate:.2f}s)")
-        if not args.gt_compare: return
+                    f"mean={db.mean():.1f} dB  shape={gm_cached.shape}")
+
+        if not args.gt_compare:
+            # GT-only: vocode ground-truth mel → wav/png, then stop
+            audio = vocoder.synthesize(gm_cached)
+            wpath = (Path(args.synth_out) if args.synth_out
+                     else Path(f"gt_{args.gt_sample_id}.wav"))
+            wpath.parent.mkdir(parents=True, exist_ok=True)
+            save_wav(audio, str(wpath), mel_cfg.sample_rate)
+            plot_mel(gm_cached, f"GT: {gt_text_cached[:50]}",
+                     str(wpath.with_suffix(".png")), logger)
+            logger.info(f"GT audio → {wpath}  "
+                        f"({len(audio)/mel_cfg.sample_rate:.2f}s)")
+            return
+        # gt_compare: do not write GT to --synth_out (that path is for model).
+        # model text = this sample's transcript (ignore default --synth_text).
 
     if args.use_gt_mel and args.synth_text:
         gm = _find_gt_text(args.synth_text, args.output_dir, logger)
         if gm is not None:
             audio = vocoder.synthesize(gm)
-            wpath = args.synth_out or "gt_synth.wav"
-            save_wav(audio, wpath, mel_cfg.sample_rate)
+            wpath = Path(args.synth_out) if args.synth_out else Path("gt_synth.wav")
+            wpath.parent.mkdir(parents=True, exist_ok=True)
+            save_wav(audio, str(wpath), mel_cfg.sample_rate)
             plot_mel(gm, f"GT: {args.synth_text[:50]}",
-                     str(Path(wpath).with_suffix(".png")), logger)
+                     str(wpath.with_suffix(".png")), logger)
             logger.info(f"GT-matched audio → {wpath}"); return
         logger.warning("No text match for --use_gt_mel; running model inference.")
 
-    model = load_model(args.output_dir, logger); model.to(device)
-    text  = args.synth_text or "မင်္ဂလာပါ ကျောင်းသားများ"
+    model = load_model(args.output_dir, logger, checkpoint=args.checkpoint)
+    model.to(device)
+    if gt_text_cached is not None:
+        text = gt_text_cached
+    else:
+        text = args.synth_text or "မင်္ဂလာပါ ကျောင်းသားများ"
     logger.info(f"Synthesizing: {text!r}")
 
     t0 = time.time()
@@ -1073,26 +1297,39 @@ def run_synth(args, logger):
                                mean_fpc=mean_fpc)
     logger.info(f"Acoustic model: {(time.time()-t0)*1000:.0f} ms")
 
-    wpath = args.synth_out or str(out/"synthesized.wav")
+    if args.synth_out:
+        wpath = Path(args.synth_out)
+    elif args.gt_sample_id:
+        wpath = out / "gt_output" / f"{args.gt_sample_id}_synth.wav"
+    else:
+        wpath = out / "synthesized.wav"
+    wpath.parent.mkdir(parents=True, exist_ok=True)
     plot_mel(mel_pred, f"TTS NAR: {text[:50]}",
-             str(Path(wpath).with_suffix(".png")), logger)
+             str(wpath.with_suffix(".png")), logger)
+
+    if args.save_mel:
+        mel_path = wpath.with_suffix(".npy")
+        np.save(mel_path, mel_pred.astype(np.float32))
+        logger.info(f"Pred mel → {mel_path}  shape={mel_pred.shape}")
 
     t1 = time.time()
     audio = vocoder.synthesize(mel_pred)
-    save_wav(audio, wpath, mel_cfg.sample_rate)
+    save_wav(audio, str(wpath), mel_cfg.sample_rate)
     dur = len(audio)/mel_cfg.sample_rate
     logger.info(f"Vocoder: {(time.time()-t1)*1000:.0f} ms  |  "
                 f"Audio → {wpath}  ({dur:.2f}s)")
 
     if args.gt_compare:
-        gm = _find_gt_text(text, args.output_dir, logger)
+        gm = gm_cached if gm_cached is not None else _find_gt_text(
+            text, args.output_dir, logger)
         if gm is not None:
             ga = vocoder.synthesize(gm)
-            gw = str(Path(wpath).stem)+"_GT.wav"
-            save_wav(ga, gw, mel_cfg.sample_rate)
+            gw = wpath.with_name(wpath.stem + "_GT.wav")
+            save_wav(ga, str(gw), mel_cfg.sample_rate)
             logger.info(f"GT comparison → {gw}")
             plot_comparison(mel_pred, gm,
-                            str(Path(wpath).stem)+"_compare.png", logger)
+                            str(wpath.with_name(wpath.stem + "_compare.png")),
+                            logger)
         else:
             logger.info("No exact GT match found.")
 
@@ -1105,7 +1342,7 @@ def run_eval(args, logger):
     out = Path(args.output_dir)
     vocab, mel_cfg = _load_artifacts(args.output_dir)
     mean_fpc = _load_mean_fpc(args.output_dir, logger)
-    model = load_model(args.output_dir, logger)
+    model = load_model(args.output_dir, logger, checkpoint=args.checkpoint)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
@@ -1115,7 +1352,11 @@ def run_eval(args, logger):
 
     logger.info(f"Evaluating {n_ev} utterances ...")
     ed = out/"eval_output"; ed.mkdir(exist_ok=True)
-    vocoder = Vocoder(mel_cfg, logger, use_neural=not args.no_neural_vocoder)
+    vocoder = Vocoder(
+        mel_cfg, logger,
+        backend=resolve_vocoder_backend(args),
+        waveglow_sigma=args.waveglow_sigma,
+    )
     results=[]; maes=[]; rtfs=[]; ts=[]
 
     for i, s in enumerate(test_s[:n_ev]):
@@ -1214,18 +1455,29 @@ def build_parser():
     p.add_argument("--synth_text",   type=str,
                    default="မင်္ဂလာပါ ကျောင်းသားများ")
     p.add_argument("--synth_out",    type=str,   default=None)
+    p.add_argument("--save_mel",     action="store_true",
+                   help="Also save predicted mel as .npy next to --synth_out")
     p.add_argument("--speed_factor", type=float, default=1.0,
                    help="0.8=slower  1.0=normal  1.2=faster")
     p.add_argument("--eval_n",     type=int, default=50)
     p.add_argument("--log_file",   default=None)
     p.add_argument("--verbose",    action="store_true")
     p.add_argument("--seed",       type=int, default=42)
-    p.add_argument("--resume",     type=str, default=None)
+    p.add_argument("--resume",     type=str, default=None,
+                   help="Resume training from this checkpoint")
+    p.add_argument("--checkpoint", type=str, default=None,
+                   help="Model .pt for synth/eval (default: {output_dir}/best_model.pt)")
     p.add_argument("--list_samples",      action="store_true")
     p.add_argument("--gt_sample_id",      type=str, default=None)
     p.add_argument("--use_gt_mel",        action="store_true")
     p.add_argument("--gt_compare",        action="store_true")
-    p.add_argument("--no_neural_vocoder", action="store_true")
+    p.add_argument("--vocoder", choices=["hifigan", "waveglow", "griffin_lim"],
+                   default="hifigan",
+                   help="Mel→wav backend (default: hifigan)")
+    p.add_argument("--waveglow_sigma", type=float, default=0.6,
+                   help="WaveGlow infer noise scale (typical 0.6)")
+    p.add_argument("--no_neural_vocoder", action="store_true",
+                   help="Alias for --vocoder griffin_lim")
     return p
 
 
